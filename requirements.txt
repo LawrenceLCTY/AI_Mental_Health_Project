@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+transformers>=4.30
+accelerate
+gradio
+diffusers
+safetensors
+python-multipart
+python-dotenv
+pydantic
+Pillow
+regex
