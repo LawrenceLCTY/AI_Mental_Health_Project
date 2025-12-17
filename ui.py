@@ -44,13 +44,26 @@ def generate_post(fragments):
             f"{API_URL}/image",
             json={"theme": intent}
         ).json()
-        img_path = img_resp.get("image_path", None)
-    except Exception:
-        pass
+        
+        img_url = img_resp.get("image_url", None)
+        
+        if img_url:
+            # Convert URL path to local file path
+            # From: /outputs/images/mental_health_...png
+            # To: ./outputs/images/mental_health_...png
+            img_path = f".{img_url}"  # Just add a dot at the beginning
+            print(f"Image path: {img_path}")
+            
+    except Exception as e:
+        print(f"Image error: {e}")
+        import traceback
+        traceback.print_exc()
 
     status = "⚠️ Safety review applied" if flagged else "✅ Safe"
 
+    print(f"Final img_path being returned: {img_path}")
     return f"{status}\n\n{text}", img_path
+
 
 
 with gr.Blocks(title="AI Mental Health Content Generator") as demo:
@@ -82,4 +95,6 @@ with gr.Blocks(title="AI Mental Health Content Generator") as demo:
         outputs=[output_text, output_image]
     )
 
-demo.launch(server_name="0.0.0.0", server_port=7860)
+demo.launch(server_name="0.0.0.0", 
+            server_port=7860, 
+            allowed_paths=["./outputs"])

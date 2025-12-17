@@ -1,4 +1,3 @@
-# app.py
 import os
 import re
 import json
@@ -6,17 +5,21 @@ import logging
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from pathlib import Path
 from PIL import Image
 import torch
+import uuid
+from datetime import datetime
 
 # transformers
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 # Qwen-VL may use a special class via trust_remote_code
 from transformers import AutoProcessor
-from diffusers import StableDiffusionPipeline  # fallback only if you prefer SD
+from diffusers import StableDiffusionXLPipeline  # Using SDXL Refiner
 
 # local helpers
 import utils.safety as safety_utils
@@ -26,39 +29,49 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
 # ---------- Config ----------
-QWEN_INSTRUCT = os.getenv("QWEN_INSTRUCT", "qwen/qwen3-7b-instruct")   # example id
-QWEN_VL = os.getenv("QWEN_VL", "qwen/qwen3-vl-7b")                     # example id
+QWEN_INSTRUCT = os.getenv("QWEN_INSTRUCT", "qwen/qwen3-7b-instruct")
+QWEN_VL = os.getenv("QWEN_VL", "qwen/qwen3-vl-7b")
+SD_MODEL = os.getenv("SD_MODEL", "stabilityai/stable-diffusion-xl-refiner-1.0")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 logging.info(f"Device: {DEVICE}")
 
+# Create output directories
+OUTPUT_DIR = Path("outputs")
+IMAGE_DIR = OUTPUT_DIR / "images"
+IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+
 # ---------- Load models ----------
 # Text model (Qwen3-Instruct) - used for intent, outline, style, critic
 tokenizer = AutoTokenizer.from_pretrained(QWEN_INSTRUCT, trust_remote_code=True, local_files_only=True)
-text_model = AutoModelForCausalLM.from_pretrained(QWEN_INSTRUCT, trust_remote_code=True, torch_dtype=torch.float16 if DEVICE=="cuda" else None, local_files_only=True)
+text_model = AutoModelForCausalLM.from_pretrained(
+    QWEN_INSTRUCT, 
+    trust_remote_code=True, 
+    torch_dtype=torch.float16 if DEVICE=="cuda" else torch.float32,
+    local_files_only=True
+)
 text_model.to(DEVICE)
 text_pipe = pipeline("text-generation", model=text_model, tokenizer=tokenizer, device=0 if DEVICE=="cuda" else -1)
 
-# Qwen3-VL: processor + model (for image generation tasks Qwen3-VL may expose text2im)
-# We will try to load a multimodal pipeline. If not available, fallback to calling Qwen-VL's text generator
-vl_processor = None
-vl_pipeline = None
-try:
-    vl_processor = AutoProcessor.from_pretrained(QWEN_VL, trust_remote_code=True, local_files_only=True)
-    # Many Qwen-VL distributions expose .from_pretrained to generate images via a .generate or special pipeline.
-    # If a direct text->image is not available, we will generate image prompts with Qwen3-Instruct and call Stable Diffusion as fallback.
-    # For simplicity, we use Qwen-VL for prompt crafting and SD for actual rendering if Qwen-VL rendering isn't available locally.
-    # If your Qwen-VL supports .from_pretrained(..., device_map="auto") for text->image, replace below accordingly.
-    logging.info("Loaded Qwen-VL processor (for multimodal prompts).")  
-except Exception as e:
-    logging.warning("Could not load Qwen-VL processor: %s", e)
+# Qwen3-VL: processor + model
+# vl_processor = None
+# vl_pipeline = None
+# try:
+#     vl_processor = AutoProcessor.from_pretrained(QWEN_VL, trust_remote_code=True, local_files_only=True)
+#     logging.info("Loaded Qwen-VL processor (for multimodal prompts).")  
+# except Exception as e:
+#     logging.warning("Could not load Qwen-VL processor: %s", e)
 
-# Optional: Stable Diffusion fallback for image rendering (if Qwen-VL not available for text->image)
-SD_MODEL = os.getenv("SD_MODEL", "runwayml/stable-diffusion-v1-5")
+# Stable Diffusion XL Refiner for image rendering
 sd_pipe = None
 try:
-    sd_pipe = StableDiffusionPipeline.from_pretrained(SD_MODEL, torch_dtype=torch.float16 if DEVICE=="cuda" else None, local_files_only=True).to(DEVICE)
-    logging.info("Stable Diffusion fallback loaded.")
+    sd_pipe = StableDiffusionXLPipeline.from_pretrained(
+        SD_MODEL, 
+        torch_dtype=torch.float16 if DEVICE=="cuda" else torch.float32,
+        local_files_only=True,
+        use_safetensors=True
+    ).to(DEVICE)
+    logging.info("Stable Diffusion XL Refiner loaded.")
 except Exception as e:
     logging.warning("Stable Diffusion not loaded (will skip image rendering): %s", e)
 
@@ -71,6 +84,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount static files for serving generated images
+app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
 
 # ---------- Models ----------
 class IntentRequest(BaseModel):
@@ -97,7 +113,6 @@ class ImageRequest(BaseModel):
     composition: Optional[str] = "single character, calm setting, minimal background"
 
 # ---------- Prompts (optimized for Qwen3) ----------
-# Use instruction style: system:..., user:... is abstracted here since we pass plain text prompts.
 INTENT_PROMPT = """
 系统: 你是高性能的意图解析与槽位抽取器（中文）。
 用户: 我给你一些碎片化的用户输入，请解析出明确写作意图、目标输出类型、以及关键槽位（audience, length, tone, require_references）。
@@ -126,14 +141,14 @@ OUTLINE_PROMPT = """
 
 FEWSHOT_STYLE_PROMPT = """
 系统: 你是风格化段落生成器（中文，Qwen3-指令格式优化）。
-说明: 给定示例风格和一段大纲，请把大纲转换成目标风格的段落（不超过200字），保持科学性且避免诊断性措辞。
+说明: 给定示例风格和一段大纲，请把大纲转换成目标风格的段落（200-400字），保持科学性且避免诊断性措辞。
 示例风格:
 {style_examples}
 
 目标风格: {target_style}
 大纲段: {outline_item}
 
-只返回纯文本段落，不要包含额外说明或元数据。
+请生成完整的段落内容，确保内容充实、连贯且有价值。只返回纯文本段落，不要包含额外说明或元数据。
 """
 
 CRITIC_PROMPT = """
@@ -152,7 +167,7 @@ CRITIC_PROMPT = """
 
 IMAGE_PROMPT_TEMPLATE = """
 系统: 你是图像提示工程师（中文）。
-任务: 根据主题、风格与构图要求生成一个可直接用于图像生成器（Stable Diffusion 或 Qwen3-VL）的英文/中文混合提示词（短句），同时返回一段 1-2 句的备用说明（中文）供编辑。
+任务: 根据主题、风格与构图要求生成一个可直接用于图像生成器（Stable Diffusion XL）的英文提示词（短句），同时返回一段 1-2 句的备用说明（中文）供编辑。
 主题: {theme}
 风格: {style}
 构图: {composition}
@@ -164,12 +179,34 @@ IMAGE_PROMPT_TEMPLATE = """
 
 # ---------- Utilities ----------
 def run_text_generation(prompt: str, max_tokens: int = 512, temperature: float = 0.7, do_sample: bool = True) -> str:
-    out = text_pipe(prompt, max_new_tokens=max_tokens, do_sample=do_sample, temperature=temperature)[0]["generated_text"]
-    # If the model simply echoes the prompt, try to trim
-    generated = out[len(prompt):] if out.startswith(prompt) else out
-    return generated.strip()
+    """Generate text with better token limits"""
+    try:
+        out = text_pipe(
+            prompt, 
+            max_new_tokens=max_tokens, 
+            do_sample=do_sample, 
+            temperature=temperature,
+            top_p=0.9,
+            repetition_penalty=1.1
+        )[0]["generated_text"]
+        
+        # If the model simply echoes the prompt, try to trim
+        generated = out[len(prompt):] if out.startswith(prompt) else out
+        return generated.strip()
+    except Exception as e:
+        logging.error(f"Text generation error: {e}")
+        raise HTTPException(status_code=500, detail=f"Text generation failed: {str(e)}")
 
 def extract_json_from_text(text: str) -> Optional[Dict]:
+    # First, try to extract content from markdown code blocks
+    code_block_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, flags=re.S)
+    if code_block_match:
+        try:
+            return json.loads(code_block_match.group(1))
+        except Exception:
+            pass
+    
+    # Fallback: look for raw JSON
     m = re.search(r'\{.*\}', text, flags=re.S)
     if not m:
         return None
@@ -183,6 +220,15 @@ def extract_json_from_text(text: str) -> Optional[Dict]:
             return json.loads(cleaned)
         except Exception:
             return None
+
+def save_generated_image(image: Image.Image) -> str:
+    """Save image and return URL path"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"mental_health_{timestamp}_{uuid.uuid4().hex[:8]}.png"
+    filepath = IMAGE_DIR / filename
+    image.save(filepath)
+    # Return URL path that can be accessed via /outputs/images/...
+    return f"/outputs/images/{filename}"
 
 # ---------- Safety middleware (dependency) ----------
 async def safety_dependency(req: Request):
@@ -232,19 +278,22 @@ def generate(req: GenerateRequest):
         {"style_name":"温柔引导", "example":"当你感到焦虑时，先关注呼吸，做三次深呼吸：吸气-屏气-呼气。"},
         {"style_name":"学术科普", "example":"研究表明，规律睡眠可提升情绪调节能力，相关文献如..."}
     ]
+    
+    # INCREASED max_tokens for fuller paragraphs
     for item in req.outline:
         prompt = FEWSHOT_STYLE_PROMPT.format(
             style_examples=json.dumps(se, ensure_ascii=False),
             target_style=req.tone,
             outline_item=item
         )
-        out = run_text_generation(prompt, max_tokens=300, temperature=0.7, do_sample=True)
+        # Increased from 300 to 800 tokens to allow complete paragraphs
+        out = run_text_generation(prompt, max_tokens=800, temperature=0.7, do_sample=True)
         paragraphs.append(out.strip())
 
     full_text = "\n\n".join(paragraphs)
 
     # Critic check before returning
-    critic_out = run_text_generation(CRITIC_PROMPT.format(text=full_text), max_tokens=256, temperature=0.0, do_sample=False)
+    critic_out = run_text_generation(CRITIC_PROMPT.format(text=full_text), max_tokens=512, temperature=0.0, do_sample=False)
     parsed_critic = extract_json_from_text(critic_out) or {}
     flagged = parsed_critic.get("flagged", False)
     if flagged:
@@ -254,35 +303,81 @@ def generate(req: GenerateRequest):
 
 @app.post("/critic", dependencies=[Depends(safety_dependency)])
 def critic(req: CriticRequest):
-    out = run_text_generation(CRITIC_PROMPT.format(text=req.text), max_tokens=256, temperature=0.0, do_sample=False)
+    out = run_text_generation(CRITIC_PROMPT.format(text=req.text), max_tokens=512, temperature=0.0, do_sample=False)
     parsed = extract_json_from_text(out) or {}
     # ensure format
     return parsed
 
 @app.post("/image", dependencies=[Depends(safety_dependency)])
 def make_image(req: ImageRequest):
-    # Step 1: craft image prompt with Qwen3-VL (or Qwen3-Instruct if VL unavailable)
-    image_prompt_json = run_text_generation(IMAGE_PROMPT_TEMPLATE.format(theme=req.theme, style=req.style, composition=req.composition), max_tokens=200, temperature=0.2, do_sample=False)
+    # Step 1: craft image prompt
+    prompt = IMAGE_PROMPT_TEMPLATE.format(theme=req.theme, style=req.style, composition=req.composition)
+    
+    logging.info(f"=== IMAGE PROMPT GENERATION ===")
+    logging.info(f"Theme: {req.theme}")
+    logging.info(f"Prompt sent to model:\n{prompt}")
+    
+    image_prompt_json = run_text_generation(
+        prompt, 
+        max_tokens=200, 
+        do_sample=False
+    )
+    
+    logging.info(f"Raw model output:\n{image_prompt_json}")
+    
     parsed = extract_json_from_text(image_prompt_json)
+    logging.info(f"Parsed JSON: {parsed}")
+    
     if parsed and "image_prompt" in parsed:
         img_prompt = parsed["image_prompt"]
+        logging.info(f"Using generated prompt: {img_prompt}")
     else:
-        # fallback short english stable-diffusion prompt
+        # fallback
         img_prompt = f"A warm flat-style illustration of a calm person in a cozy room, soft warm colors, minimal background, social-media banner. Theme: {req.theme}"
+        logging.info(f"Using FALLBACK prompt: {img_prompt}")
 
-    # Step 2: render image via SD fallback if available
+    # Step 2: render image via SDXL if available
     if sd_pipe is None:
-        # If no renderer, return only prompt for external rendering (e.g. Qwen-VL online)
-        return {"image_prompt": img_prompt, "note_cn": parsed.get("note_cn","") if parsed else ""}
-    # generate
-    image = sd_pipe(img_prompt, guidance_scale=7.5, num_inference_steps=20).images[0]
-    out_path = io_utils.save_image_temp(image, prefix="aimh_qwen3")
-    return {"image_path": out_path, "image_prompt": img_prompt, "note_cn": parsed.get("note_cn","") if parsed else ""}
+        # If no renderer, return only prompt for external rendering
+        return {"image_url": None, "image_prompt": img_prompt, "note_cn": parsed.get("note_cn","") if parsed else ""}
+    
+    try:
+        # Generate with SDXL Refiner
+        image = sd_pipe(
+            img_prompt, 
+            num_inference_steps=30,
+            guidance_scale=7.5
+        ).images[0]
+        
+        # Save and get URL
+        image_url = save_generated_image(image)
+        
+        logging.info(f"Image generated and saved: {image_url}")
+        
+        return {
+            "image_url": image_url,  # Changed from image_path to image_url
+            "image_prompt": img_prompt, 
+            "note_cn": parsed.get("note_cn","") if parsed else ""
+        }
+    except Exception as e:
+        logging.error(f"Image generation error: {e}")
+        raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)}")
 
 # ---------- Health check ----------
 @app.get("/health")
 def health():
-    return {"status":"ok", "device": DEVICE, "qwen_instruct": QWEN_INSTRUCT, "qwen_vl": QWEN_VL}
+    return {
+        "status": "ok", 
+        "device": DEVICE, 
+        "qwen_instruct": QWEN_INSTRUCT, 
+        "qwen_vl": QWEN_VL,
+        "sd_model": SD_MODEL,
+        "image_dir": str(IMAGE_DIR),
+        "models_loaded": {
+            "text_model": text_model is not None,
+            "sd_pipe": sd_pipe is not None
+        }
+    }
 
 # ---------- Run via uvicorn ----------
 if __name__ == "__main__":
