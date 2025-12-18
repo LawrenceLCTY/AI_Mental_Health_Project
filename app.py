@@ -3,10 +3,9 @@ import re
 import json
 import logging
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, Request, HTTPException, Depends, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from pathlib import Path
@@ -14,12 +13,13 @@ from PIL import Image
 import torch
 import uuid
 from datetime import datetime
+import base64
+from io import BytesIO
 
-# transformers
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
-# Qwen-VL may use a special class via trust_remote_code
-from transformers import AutoProcessor
-from diffusers import StableDiffusionXLPipeline  # Using SDXL Refiner
+# Qwen3-VL specific imports
+from transformers import Qwen3VLForConditionalGeneration, AutoTokenizer, AutoProcessor
+from qwen_vl_utils import process_vision_info
+from diffusers import StableDiffusionXLPipeline, DPMSolverMultistepScheduler
 
 # local helpers
 import utils.safety as safety_utils
@@ -29,9 +29,8 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
 # ---------- Config ----------
-QWEN_INSTRUCT = os.getenv("QWEN_INSTRUCT", "qwen/qwen3-7b-instruct")
-QWEN_VL = os.getenv("QWEN_VL", "qwen/qwen3-vl-7b")
-SD_MODEL = os.getenv("SD_MODEL", "stabilityai/stable-diffusion-xl-refiner-1.0")
+QWEN_VL = os.getenv("QWEN_VL")
+SD_MODEL = os.getenv("SD_MODEL")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 logging.info(f"Device: {DEVICE}")
@@ -39,44 +38,50 @@ logging.info(f"Device: {DEVICE}")
 # Create output directories
 OUTPUT_DIR = Path("outputs")
 IMAGE_DIR = OUTPUT_DIR / "images"
+UPLOAD_DIR = OUTPUT_DIR / "uploads"
 IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------- Load models ----------
-# Text model (Qwen3-Instruct) - used for intent, outline, style, critic
-tokenizer = AutoTokenizer.from_pretrained(QWEN_INSTRUCT, trust_remote_code=True, local_files_only=True)
-text_model = AutoModelForCausalLM.from_pretrained(
-    QWEN_INSTRUCT, 
-    trust_remote_code=True, 
-    torch_dtype=torch.float16 if DEVICE=="cuda" else torch.float32,
+# ---------- Load Qwen3-VL with MULTIMODAL support ----------
+logging.info(f"Loading Qwen3-VL from {QWEN_VL}...")
+
+# Use the correct model class for multimodal
+vl_model = Qwen3VLForConditionalGeneration.from_pretrained(
+    QWEN_VL,
+    trust_remote_code=True,
+    torch_dtype=torch.bfloat16 if DEVICE == "cuda" else torch.float32,
+    local_files_only=True,
+    device_map="auto"  # Automatically handles multi-GPU if needed
+)
+
+processor = AutoProcessor.from_pretrained(
+    QWEN_VL,
+    trust_remote_code=True,
     local_files_only=True
 )
-text_model.to(DEVICE)
-text_pipe = pipeline("text-generation", model=text_model, tokenizer=tokenizer, device=0 if DEVICE=="cuda" else -1)
 
-# Qwen3-VL: processor + model
-# vl_processor = None
-# vl_pipeline = None
-# try:
-#     vl_processor = AutoProcessor.from_pretrained(QWEN_VL, trust_remote_code=True, local_files_only=True)
-#     logging.info("Loaded Qwen-VL processor (for multimodal prompts).")  
-# except Exception as e:
-#     logging.warning("Could not load Qwen-VL processor: %s", e)
+logging.info(f"Qwen3-VL loaded successfully")
 
-# Stable Diffusion XL Refiner for image rendering
+# ---------- Load SDXL ----------
 sd_pipe = None
+sd_tokenizer = None
 try:
     sd_pipe = StableDiffusionXLPipeline.from_pretrained(
         SD_MODEL, 
         torch_dtype=torch.float16 if DEVICE=="cuda" else torch.float32,
         local_files_only=True,
-        use_safetensors=True
-    ).to(DEVICE)
-    logging.info("Stable Diffusion XL Refiner loaded.")
+        use_safetensors=True,
+        variant="fp16" if DEVICE=="cuda" else None
+    )
+    sd_pipe.scheduler = DPMSolverMultistepScheduler.from_config(sd_pipe.scheduler.config)
+    sd_pipe = sd_pipe.to(DEVICE)
+    sd_tokenizer = sd_pipe.tokenizer
+    logging.info("SDXL Base loaded successfully")
 except Exception as e:
-    logging.warning("Stable Diffusion not loaded (will skip image rendering): %s", e)
+    logging.warning(f"SDXL not loaded: {e}")
 
 # ---------- FastAPI setup ----------
-app = FastAPI(title="AIMH-Qwen3 Backend")
+app = FastAPI(title="AIMH-Qwen3-VL Backend")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -85,23 +90,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount static files for serving generated images
 app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
 
-# ---------- Models ----------
+# ---------- Request Models ----------
 class IntentRequest(BaseModel):
     fragments: str
     user_profile: Optional[Dict[str, Any]] = None
+    image_path: Optional[str] = None  # Optional image input
 
 class OutlineRequest(BaseModel):
     intent: str
     slots: Dict[str, Any]
+    image_path: Optional[str] = None  # Optional image context
 
 class GenerateRequest(BaseModel):
     outline: List[str]
     style_examples: Optional[List[Dict[str,str]]] = None
     tone: Optional[str] = "温和且专业"
     length: Optional[str] = "短文"
+    image_path: Optional[str] = None  # Optional image context
 
 class CriticRequest(BaseModel):
     text: str
@@ -112,10 +119,151 @@ class ImageRequest(BaseModel):
     style: Optional[str] = "简洁插画, 温暖色调"
     composition: Optional[str] = "single character, calm setting, minimal background"
 
-# ---------- Prompts (optimized for Qwen3) ----------
+# ---------- Unified Text Generation (supports text + images) ----------
+def generate_with_qwen3vl(
+    prompt: str,
+    image_path: Optional[str] = None,
+    max_tokens: int = 512,
+    temperature: float = 0.7
+) -> str:
+    """
+    Generate text using Qwen3-VL
+    Supports both text-only and text+image inputs
+    """
+    try:
+        # Build message content
+        content = []
+        
+        # Add image if provided
+        if image_path:
+            content.append({
+                "type": "image",
+                "image": image_path
+            })
+        
+        # Add text prompt
+        content.append({
+            "type": "text",
+            "text": prompt
+        })
+        
+        # Format as chat message
+        messages = [
+            {
+                "role": "user",
+                "content": content
+            }
+        ]
+        
+        # Apply chat template
+        text = processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        
+        # Process vision info if image present
+        image_inputs, video_inputs = process_vision_info(messages)
+        
+        # Prepare inputs
+        inputs = processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt"
+        )
+        inputs = inputs.to(vl_model.device)
+        
+        # Generate
+        with torch.no_grad():
+            generated_ids = vl_model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                do_sample=(temperature > 0),
+                temperature=temperature if temperature > 0 else 1.0,
+                top_p=0.9,
+                repetition_penalty=1.1
+            )
+        
+        # Trim input from output
+        generated_ids_trimmed = [
+            out_ids[len(in_ids):] 
+            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        
+        # Decode
+        output_text = processor.batch_decode(
+            generated_ids_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False
+        )[0]
+        
+        return output_text.strip()
+        
+    except Exception as e:
+        logging.error(f"Generation error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
+
+# ---------- Helper Functions ----------
+def extract_json_from_text(text: str) -> Optional[Dict]:
+    # Try markdown code blocks first
+    code_block_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, flags=re.S)
+    if code_block_match:
+        try:
+            return json.loads(code_block_match.group(1))
+        except Exception:
+            pass
+    
+    # Fallback: raw JSON
+    m = re.search(r'\{.*\}', text, flags=re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        cleaned = re.sub(r"(['\"])?:\s*'([^']*)'", r'"\1": "\2"', m.group(0))
+        try:
+            return json.loads(cleaned)
+        except Exception:
+            return None
+
+def truncate_prompt_for_sdxl(prompt: str, max_tokens: int = 75) -> str:
+    if sd_tokenizer is None:
+        words = prompt.split()
+        return " ".join(words[:max_tokens]) if len(words) > max_tokens else prompt
+    
+    tokens = sd_tokenizer.encode(prompt)
+    if len(tokens) <= max_tokens:
+        return prompt
+    
+    truncated_tokens = tokens[:max_tokens]
+    return sd_tokenizer.decode(truncated_tokens, skip_special_tokens=True)
+
+def save_generated_image(image: Image.Image) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"mental_health_{timestamp}_{uuid.uuid4().hex[:8]}.png"
+    filepath = IMAGE_DIR / filename
+    image.save(filepath)
+    return f"/outputs/images/{filename}"
+
+def save_uploaded_file(upload_file: UploadFile) -> str:
+    """Save uploaded image and return path"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"upload_{timestamp}_{uuid.uuid4().hex[:8]}_{upload_file.filename}"
+    filepath = UPLOAD_DIR / filename
+    
+    with open(filepath, "wb") as f:
+        f.write(upload_file.file.read())
+    
+    return str(filepath)
+
+# ---------- Prompts ----------
 INTENT_PROMPT = """
 系统: 你是高性能的意图解析与槽位抽取器（中文）。
-用户: 我给你一些碎片化的用户输入，请解析出明确写作意图、目标输出类型、以及关键槽位（audience, length, tone, require_references）。
+用户: 我给你一些碎片化的用户输入{image_context}，请解析出明确写作意图、目标输出类型、以及关键槽位（audience, length, tone, require_references）。
 输入碎片:
 \"\"\"{fragments}\"\"\"
 
@@ -134,14 +282,14 @@ INTENT_PROMPT = """
 
 OUTLINE_PROMPT = """
 系统: 你是心理科普大纲生成器（中文）。
-用户: 依据意图与槽位，生成 3-6 步可执行的大纲，每一步一句话并附 10-30 字说明。返回 JSON: {{ "outline": ["step1|说明","step2|说明", ...] }}
+用户: 依据意图与槽位{image_context}，生成 3-6 步可执行的大纲，每一步一句话并附 10-30 字说明。返回 JSON: {{ "outline": ["step1|说明","step2|说明", ...] }}
 意图: {intent}
 槽位: {slots}
 """
 
 FEWSHOT_STYLE_PROMPT = """
-系统: 你是风格化段落生成器（中文，Qwen3-指令格式优化）。
-说明: 给定示例风格和一段大纲，请把大纲转换成目标风格的段落（200-400字），保持科学性且避免诊断性措辞。
+系统: 你是风格化段落生成器（中文）。
+说明: 给定示例风格和一段大纲{image_context}，请把大纲转换成目标风格的段落（200-400字），保持科学性且避免诊断性措辞。
 示例风格:
 {style_examples}
 
@@ -166,74 +314,17 @@ CRITIC_PROMPT = """
 """
 
 IMAGE_PROMPT_TEMPLATE = """
-系统: 你是图像提示工程师（中文）。
-任务: 根据主题、风格与构图要求生成一个可直接用于图像生成器（Stable Diffusion XL）的英文提示词（短句），同时返回一段 1-2 句的备用说明（中文）供编辑。
-主题: {theme}
-风格: {style}
-构图: {composition}
-禁忌: 真实创伤照片、面部近照、医疗操作细节、任何血腥或恐怖元素
+Create a short English prompt (max 50 words) for Stable Diffusion XL.
+Theme: {theme}
+Style: {style}
+Composition: {composition}
 
-返回 JSON:
-{{"image_prompt": "...", "note_cn": "..."}}
+Return JSON: {{"image_prompt": "...", "note_cn": "..."}}
 """
 
-# ---------- Utilities ----------
-def run_text_generation(prompt: str, max_tokens: int = 512, temperature: float = 0.7, do_sample: bool = True) -> str:
-    """Generate text with better token limits"""
-    try:
-        out = text_pipe(
-            prompt, 
-            max_new_tokens=max_tokens, 
-            do_sample=do_sample, 
-            temperature=temperature,
-            top_p=0.9,
-            repetition_penalty=1.1
-        )[0]["generated_text"]
-        
-        # If the model simply echoes the prompt, try to trim
-        generated = out[len(prompt):] if out.startswith(prompt) else out
-        return generated.strip()
-    except Exception as e:
-        logging.error(f"Text generation error: {e}")
-        raise HTTPException(status_code=500, detail=f"Text generation failed: {str(e)}")
-
-def extract_json_from_text(text: str) -> Optional[Dict]:
-    # First, try to extract content from markdown code blocks
-    code_block_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, flags=re.S)
-    if code_block_match:
-        try:
-            return json.loads(code_block_match.group(1))
-        except Exception:
-            pass
-    
-    # Fallback: look for raw JSON
-    m = re.search(r'\{.*\}', text, flags=re.S)
-    if not m:
-        return None
-    try:
-        obj = json.loads(m.group(0))
-        return obj
-    except Exception:
-        # try to sanitize trailing commas or single quotes
-        cleaned = re.sub(r"(['\"])?:\s*'([^']*)'", r'"\1": "\2"', m.group(0))
-        try:
-            return json.loads(cleaned)
-        except Exception:
-            return None
-
-def save_generated_image(image: Image.Image) -> str:
-    """Save image and return URL path"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"mental_health_{timestamp}_{uuid.uuid4().hex[:8]}.png"
-    filepath = IMAGE_DIR / filename
-    image.save(filepath)
-    # Return URL path that can be accessed via /outputs/images/...
-    return f"/outputs/images/{filename}"
-
-# ---------- Safety middleware (dependency) ----------
+# ---------- Safety Middleware ----------
 async def safety_dependency(req: Request):
     body = await req.json()
-    # quick heuristic checks on text fields in request
     check_fields = []
     if 'fragments' in body: check_fields.append(body['fragments'])
     if 'outline' in body:
@@ -245,29 +336,43 @@ async def safety_dependency(req: Request):
     aggregated = "\n".join([str(c) for c in check_fields if c])
     issues = safety_utils.heuristic_check_text(aggregated)
     if issues:
-        # return structured rejection so front-end can surface to user and require confirmation
         raise HTTPException(status_code=422, detail={"safety_issues": issues})
 
-# ---------- Endpoints (pipeline) ----------
+# ---------- Endpoints ----------
 @app.post("/intent", dependencies=[Depends(safety_dependency)])
 def extract_intent(req: IntentRequest):
-    prompt = INTENT_PROMPT.format(fragments=req.fragments)
-    raw = run_text_generation(prompt, max_tokens=256, temperature=0.0, do_sample=False)
+    image_context = " 和一张图片" if req.image_path else ""
+    prompt = INTENT_PROMPT.format(
+        fragments=req.fragments,
+        image_context=image_context
+    )
+    raw = generate_with_qwen3vl(prompt, image_path=req.image_path, max_tokens=256, temperature=0.0)
     parsed = extract_json_from_text(raw)
     if parsed is None:
-        # fallback: minimal representation
-        return {"intent": req.fragments[:60], "output_type": "short_post", "slots": {"audience":"general","length":"short","tone":"neutral","require_references":False}}
+        return {
+            "intent": req.fragments[:60],
+            "output_type": "short_post",
+            "slots": {
+                "audience": "general",
+                "length": "short",
+                "tone": "neutral",
+                "require_references": False
+            }
+        }
     return parsed
 
 @app.post("/outline", dependencies=[Depends(safety_dependency)])
 def make_outline(req: OutlineRequest):
-    prompt = OUTLINE_PROMPT.format(intent=req.intent, slots=json.dumps(req.slots, ensure_ascii=False))
-    raw = run_text_generation(prompt, max_tokens=256, temperature=0.0, do_sample=False)
+    image_context = "（参考提供的图片内容）" if req.image_path else ""
+    prompt = OUTLINE_PROMPT.format(
+        intent=req.intent,
+        slots=json.dumps(req.slots, ensure_ascii=False),
+        image_context=image_context
+    )
+    raw = generate_with_qwen3vl(prompt, image_path=req.image_path, max_tokens=256, temperature=0.0)
     parsed = extract_json_from_text(raw)
     if parsed and "outline" in parsed:
-        # split each outline item by '|' into title and note
         return parsed
-    # fallback parse heuristics: split lines
     lines = [l.strip() for l in raw.splitlines() if l.strip()]
     return {"outline": lines[:6]}
 
@@ -275,111 +380,160 @@ def make_outline(req: OutlineRequest):
 def generate(req: GenerateRequest):
     paragraphs = []
     se = req.style_examples or [
-        {"style_name":"温柔引导", "example":"当你感到焦虑时，先关注呼吸，做三次深呼吸：吸气-屏气-呼气。"},
-        {"style_name":"学术科普", "example":"研究表明，规律睡眠可提升情绪调节能力，相关文献如..."}
+        {"style_name": "温柔引导", "example": "当你感到焦虑时，先关注呼吸，做三次深呼吸：吸气-屏气-呼气。"},
+        {"style_name": "学术科普", "example": "研究表明，规律睡眠可提升情绪调节能力，相关文献如..."}
     ]
     
-    # INCREASED max_tokens for fuller paragraphs
+    image_context = "（结合图片内容）" if req.image_path else ""
+    
     for item in req.outline:
         prompt = FEWSHOT_STYLE_PROMPT.format(
             style_examples=json.dumps(se, ensure_ascii=False),
             target_style=req.tone,
-            outline_item=item
+            outline_item=item,
+            image_context=image_context
         )
-        # Increased from 300 to 800 tokens to allow complete paragraphs
-        out = run_text_generation(prompt, max_tokens=800, temperature=0.7, do_sample=True)
+        out = generate_with_qwen3vl(prompt, image_path=req.image_path, max_tokens=800, temperature=0.7)
         paragraphs.append(out.strip())
 
     full_text = "\n\n".join(paragraphs)
 
-    # Critic check before returning
-    critic_out = run_text_generation(CRITIC_PROMPT.format(text=full_text), max_tokens=512, temperature=0.0, do_sample=False)
+    # Critic check
+    critic_out = generate_with_qwen3vl(
+        CRITIC_PROMPT.format(text=full_text),
+        max_tokens=512,
+        temperature=0.0
+    )
     parsed_critic = extract_json_from_text(critic_out) or {}
     flagged = parsed_critic.get("flagged", False)
+    
     if flagged:
         safe_text = parsed_critic.get("safe_text", "")
-        return {"flagged": True, "issues": parsed_critic.get("issues", []), "suggestions": parsed_critic.get("suggestions", []), "text": safe_text or full_text}
+        return {
+            "flagged": True,
+            "issues": parsed_critic.get("issues", []),
+            "suggestions": parsed_critic.get("suggestions", []),
+            "text": safe_text or full_text
+        }
     return {"flagged": False, "text": full_text}
 
 @app.post("/critic", dependencies=[Depends(safety_dependency)])
 def critic(req: CriticRequest):
-    out = run_text_generation(CRITIC_PROMPT.format(text=req.text), max_tokens=512, temperature=0.0, do_sample=False)
-    parsed = extract_json_from_text(out) or {}
-    # ensure format
-    return parsed
+    out = generate_with_qwen3vl(
+        CRITIC_PROMPT.format(text=req.text),
+        max_tokens=512,
+        temperature=0.0
+    )
+    return extract_json_from_text(out) or {}
 
 @app.post("/image", dependencies=[Depends(safety_dependency)])
 def make_image(req: ImageRequest):
-    # Step 1: craft image prompt
-    prompt = IMAGE_PROMPT_TEMPLATE.format(theme=req.theme, style=req.style, composition=req.composition)
+    prompt = IMAGE_PROMPT_TEMPLATE.format(
+        theme=req.theme,
+        style=req.style,
+        composition=req.composition
+    )
     
     logging.info(f"=== IMAGE PROMPT GENERATION ===")
     logging.info(f"Theme: {req.theme}")
-    logging.info(f"Prompt sent to model:\n{prompt}")
     
-    image_prompt_json = run_text_generation(
-        prompt, 
-        max_tokens=200, 
-        do_sample=False
+    image_prompt_json = generate_with_qwen3vl(
+        prompt,
+        max_tokens=150,
+        temperature=0.2
     )
     
-    logging.info(f"Raw model output:\n{image_prompt_json}")
+    logging.info(f"Raw output: {image_prompt_json}")
     
     parsed = extract_json_from_text(image_prompt_json)
-    logging.info(f"Parsed JSON: {parsed}")
     
     if parsed and "image_prompt" in parsed:
         img_prompt = parsed["image_prompt"]
-        logging.info(f"Using generated prompt: {img_prompt}")
     else:
-        # fallback
-        img_prompt = f"A warm flat-style illustration of a calm person in a cozy room, soft warm colors, minimal background, social-media banner. Theme: {req.theme}"
-        logging.info(f"Using FALLBACK prompt: {img_prompt}")
-
-    # Step 2: render image via SDXL if available
+        img_prompt = f"warm illustration, calm person, cozy room, soft colors, minimal background"
+    
+    # Truncate for SDXL
+    img_prompt_truncated = truncate_prompt_for_sdxl(img_prompt, max_tokens=75)
+    
     if sd_pipe is None:
-        # If no renderer, return only prompt for external rendering
-        return {"image_url": None, "image_prompt": img_prompt, "note_cn": parsed.get("note_cn","") if parsed else ""}
+        return {
+            "image_url": None,
+            "image_prompt": img_prompt_truncated,
+            "note_cn": parsed.get("note_cn", "") if parsed else "",
+            "warning": "SD model not loaded"
+        }
     
     try:
-        # Generate with SDXL Refiner
         image = sd_pipe(
-            img_prompt, 
-            num_inference_steps=30,
-            guidance_scale=7.5
+            img_prompt_truncated,
+            num_inference_steps=25,
+            guidance_scale=7.5,
+            height=768,
+            width=1024
         ).images[0]
         
-        # Save and get URL
         image_url = save_generated_image(image)
         
-        logging.info(f"Image generated and saved: {image_url}")
+        logging.info(f"Image generated: {image_url}")
         
         return {
-            "image_url": image_url,  # Changed from image_path to image_url
-            "image_prompt": img_prompt, 
-            "note_cn": parsed.get("note_cn","") if parsed else ""
+            "image_url": image_url,
+            "image_prompt": img_prompt_truncated,
+            "note_cn": parsed.get("note_cn", "") if parsed else "",
+            "original_prompt": img_prompt if img_prompt != img_prompt_truncated else None
         }
     except Exception as e:
         logging.error(f"Image generation error: {e}")
-        raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)}")
+        return {
+            "image_url": None,
+            "image_prompt": img_prompt_truncated,
+            "note_cn": parsed.get("note_cn", "") if parsed else "",
+            "error": str(e)
+        }
 
-# ---------- Health check ----------
+# ---------- Upload Image Endpoint ----------
+@app.post("/upload_image")
+async def upload_image(file: UploadFile = File(...)):
+    """
+    Upload an image to be used as context for content generation
+    Returns the path to the uploaded image
+    """
+    try:
+        image_path = save_uploaded_file(file)
+        logging.info(f"Image uploaded: {image_path}")
+        
+        return {
+            "image_path": image_path,
+            "filename": file.filename
+        }
+        
+    except Exception as e:
+        logging.error(f"Image upload error: {e}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+# ---------- Health Check ----------
 @app.get("/health")
 def health():
     return {
-        "status": "ok", 
-        "device": DEVICE, 
-        "qwen_instruct": QWEN_INSTRUCT, 
+        "status": "ok",
+        "device": DEVICE,
         "qwen_vl": QWEN_VL,
         "sd_model": SD_MODEL,
         "image_dir": str(IMAGE_DIR),
+        "upload_dir": str(UPLOAD_DIR),
         "models_loaded": {
-            "text_model": text_model is not None,
+            "qwen3_vl": vl_model is not None,
+            "processor": processor is not None,
             "sd_pipe": sd_pipe is not None
+        },
+        "capabilities": {
+            "text_generation": True,
+            "image_context": True,
+            "image_generation": sd_pipe is not None,
+            "multimodal": True
         }
     }
 
-# ---------- Run via uvicorn ----------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 8004)), log_level="info")

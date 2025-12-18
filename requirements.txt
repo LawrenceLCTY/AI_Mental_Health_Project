@@ -9,4 +9,5 @@ python-multipart
 python-dotenv
 pydantic
 Pillow
+qwen-vl-utils
 regex
