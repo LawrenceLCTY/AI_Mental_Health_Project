@@ -1,4 +1,4 @@
-# AI Mental Health Content Generator (concise)
+# AI Mental Health Content Generator
 
 Purpose: generate safe, non-diagnostic mental-health posts (text via Qwen models) and optional images (Stable Diffusion XL).
 
