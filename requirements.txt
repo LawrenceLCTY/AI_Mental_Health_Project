@@ -2,8 +2,8 @@ fastapi
 uvicorn[standard]
 transformers>=4.30
 accelerate
-gradio
 diffusers
+google-genai
 safetensors
 python-multipart
 python-dotenv
@@ -11,3 +11,4 @@ pydantic
 Pillow
 qwen-vl-utils
 regex
+streamlit
