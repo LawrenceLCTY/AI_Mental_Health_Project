@@ -104,7 +104,7 @@ def render_config_bar():
                     key="Qwen-VL"
                 )
             with c3:
-                st.text("本地模型：无需 API Key。确保已安装 transformers/accelerate 并有足够资源。")
+                st.text("本地模型：无需 API Key。")
                 api_key = None
         
         return provider, model_name, api_key
@@ -113,6 +113,49 @@ def render_config_bar():
 # ==========================================
 # 3. 灵感输入表单组件（可复用）
 # ==========================================
+
+# def render_input_form(in_workspace=False, supports_images=False):
+#     """
+#     渲染灵感输入表单
+#     in_workspace: 是否在工作台模式（影响form的key和行为）
+#     supports_images: 当前模型是否支持图片输入
+#     """
+#     form_key = "workspace_input_form" if in_workspace else "initial_input_form"
+    
+#     with st.form(form_key):
+#         # Image upload section (only if model supports it)
+#         uploaded_file = None
+#         if supports_images:
+#             st.markdown("#### 🖼️ 图片输入 (可选)")
+#             uploaded_file = st.file_uploader(
+#                 "上传图片以辅助内容生成",
+#                 type=["png", "jpg", "jpeg", "webp"],
+#                 help="支持的格式: PNG, JPG, JPEG, WEBP"
+#             )
+#             if uploaded_file:
+#                 # Display preview
+#                 st.image(uploaded_file, caption="已上传图片预览", use_container_width=True)
+#             st.divider()
+#         else:
+#             st.info("💡 提示：当前模型不支持图片输入。切换到 Qwen-VL 模型以启用图片功能。")
+#             st.divider()
+        
+#         # Text inputs
+#         fragments = st.text_area(
+#             "意图碎片 (支持 **粗体** 强调核心观点)", 
+#             height=200,
+#             value=st.session_state.user_inputs["fragments"],
+#             placeholder="例如：写一篇关于**长期主义**的文章..."
+#         )
+#         style = st.text_input(
+#             "风格偏好 / 示例",
+#             value=st.session_state.user_inputs["style"], 
+#             placeholder="例如：理性、克制、像《经济学人》..."
+#         )
+        
+#         submitted = st.form_submit_button("🚀 开始构建", type="primary", use_container_width=True)
+        
+#         return fragments, style, uploaded_file, submitted
 
 def render_input_form(in_workspace=False, supports_images=False):
     """
@@ -137,26 +180,25 @@ def render_input_form(in_workspace=False, supports_images=False):
                 st.image(uploaded_file, caption="已上传图片预览", use_container_width=True)
             st.divider()
         else:
-            st.info("💡 提示：当前模型不支持图片输入。切换到 Qwen-VL 模型以启用图片功能。")
+            st.info("💡 提示：当前模型不支持图片输入。")
             st.divider()
-        
+            
         # Text inputs
         fragments = st.text_area(
-            "意图碎片 (支持 **粗体** 强调核心观点)", 
+            "灵感碎片", 
             height=200,
             value=st.session_state.user_inputs["fragments"],
-            placeholder="例如：写一篇关于**长期主义**的文章..."
+            placeholder="欢迎使用 markdown 语法帮助 AI 理解你的灵感：\n==高亮==需要深入理解的专业概念\n**加粗**你想要呈现在最终文本中的“金句”"
         )
         style = st.text_input(
-            "风格偏好 / 示例",
+            "风格偏好",
             value=st.session_state.user_inputs["style"], 
-            placeholder="例如：理性、克制、像《经济学人》..."
+            placeholder="例如：科普，亲切自然"
         )
         
         submitted = st.form_submit_button("🚀 开始构建", type="primary", use_container_width=True)
         
         return fragments, style, uploaded_file, submitted
-
 
 # ==========================================
 # 4. 构建流程处理
